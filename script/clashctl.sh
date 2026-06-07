@@ -354,6 +354,234 @@ function clashstatus() {
     fi
 }
 
+
+function clashpick() {
+    local group=""
+    local keyword=""
+    local list_groups=false
+    local plain=false
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+        -g|--group)
+            [ -n "$2" ] || {
+                _failcat "缺少策略组名称"
+                return 1
+            }
+            group=$2
+            shift 2
+            ;;
+        --groups|groups)
+            list_groups=true
+            shift
+            ;;
+        --plain|--no-fzf)
+            plain=true
+            shift
+            ;;
+        -h|--help)
+            cat <<EOF
+用法: clash pick [关键词] [-g 策略组] [--plain]
+
+示例:
+    clash pick              选择 Proxy 策略组中的节点
+    clash pick 美国         只显示名称/类型包含“美国”的节点
+    clash pick -g 自动选择  选择指定策略组中的节点
+    clash pick groups       列出可切换的策略组
+
+说明:
+    有 fzf 且处于交互式终端时会打开可搜索列表；否则使用编号菜单。
+EOF
+            return 0
+            ;;
+        *)
+            keyword="${keyword:+$keyword }$1"
+            shift
+            ;;
+        esac
+    done
+
+    if ! is_mihomo_running; then
+        _failcat "mihomo 进程未运行，请先执行 clash on"
+        return 1
+    fi
+
+    _verify_actual_ports 2>/dev/null || true
+    _get_ui_port
+
+    local api_secret=""
+    if [ -f "$MIHOMO_CONFIG_RUNTIME" ]; then
+        api_secret=$("$BIN_YQ" '.secret // ""' "$MIHOMO_CONFIG_RUNTIME" 2>/dev/null)
+        [ "$api_secret" = "null" ] && api_secret=""
+    fi
+
+    CLASH_PICK_API="http://127.0.0.1:${UI_PORT}" \
+    CLASH_PICK_SECRET="$api_secret" \
+    CLASH_PICK_GROUP="$group" \
+    CLASH_PICK_FILTER="$keyword" \
+    CLASH_PICK_LIST_GROUPS="$([ "$list_groups" = true ] && printf 1 || printf 0)" \
+    CLASH_PICK_PLAIN="$([ "$plain" = true ] && printf 1 || printf 0)" \
+    python3 <<'PY'
+import json
+import os
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+api_base = os.environ["CLASH_PICK_API"].rstrip("/")
+secret = os.environ.get("CLASH_PICK_SECRET", "")
+requested_group = os.environ.get("CLASH_PICK_GROUP", "").strip()
+keyword = os.environ.get("CLASH_PICK_FILTER", "").strip()
+list_groups = os.environ.get("CLASH_PICK_LIST_GROUPS") == "1"
+plain = os.environ.get("CLASH_PICK_PLAIN") == "1"
+
+
+def request(method, path, payload=None):
+    data = None
+    headers = {"Content-Type": "application/json"}
+    if secret:
+        headers["Authorization"] = f"Bearer {secret}"
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(api_base + path, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")[:300]
+        print(f"mihomo API 请求失败: HTTP {exc.code} {body}", file=sys.stderr)
+        raise SystemExit(1)
+    except Exception as exc:
+        print(f"mihomo API 不可用: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    if not raw:
+        return None
+    return json.loads(raw.decode("utf-8"))
+
+
+def is_switch_group(item):
+    return isinstance(item, dict) and isinstance(item.get("all"), list) and item.get("type") in {
+        "Selector",
+        "URLTest",
+        "Fallback",
+        "LoadBalance",
+    }
+
+
+data = request("GET", "/proxies")
+proxies = data.get("proxies", {})
+groups = [(name, item) for name, item in proxies.items() if is_switch_group(item)]
+groups.sort(key=lambda pair: (pair[0] != "Proxy", pair[0]))
+
+if not groups:
+    print("没有发现可切换的策略组", file=sys.stderr)
+    raise SystemExit(1)
+
+if list_groups:
+    print("可切换策略组:")
+    for idx, (name, item) in enumerate(groups, 1):
+        now = item.get("now") or "-"
+        count = len(item.get("all") or [])
+        print(f"{idx:>3}. {name}  当前: {now}  可选: {count}")
+    raise SystemExit(0)
+
+group_names = [name for name, _ in groups]
+if requested_group:
+    if requested_group in proxies and is_switch_group(proxies[requested_group]):
+        group = requested_group
+    else:
+        matches = [name for name in group_names if requested_group.casefold() in name.casefold()]
+        if len(matches) == 1:
+            group = matches[0]
+        else:
+            print(f"未找到唯一策略组: {requested_group}", file=sys.stderr)
+            print("可用策略组: " + ", ".join(group_names), file=sys.stderr)
+            raise SystemExit(1)
+elif "Proxy" in proxies and is_switch_group(proxies["Proxy"]):
+    group = "Proxy"
+else:
+    group = group_names[0]
+
+group_info = proxies[group]
+current = group_info.get("now") or ""
+query = keyword.casefold()
+rows = []
+for name in group_info.get("all") or []:
+    item = proxies.get(name, {})
+    proxy_type = item.get("type", "")
+    now = item.get("now", "")
+    history = item.get("history") or []
+    delay = ""
+    if history and isinstance(history[-1], dict) and history[-1].get("delay") is not None:
+        delay = f"{history[-1]['delay']}ms"
+    haystack = f"{name} {proxy_type} {now}".casefold()
+    if query and query not in haystack:
+        continue
+    rows.append({"name": name, "type": proxy_type, "delay": delay, "current": name == current})
+
+if not rows:
+    print(f"策略组 [{group}] 下没有匹配节点: {keyword}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def render_line(index, row):
+    mark = "*" if row["current"] else " "
+    meta = row["type"] or "Unknown"
+    if row["delay"]:
+        meta = f"{meta}, {row['delay']}"
+    return f"{index:>3}. {mark} {row['name']} [{meta}]"
+
+
+selected_index = None
+lines = [render_line(i, row) for i, row in enumerate(rows, 1)]
+use_fzf = (not plain and shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty())
+
+if use_fzf:
+    prompt = f"{group}> "
+    proc = subprocess.run(
+        ["fzf", "--height=80%", "--reverse", "--prompt", prompt, "--query", keyword],
+        input="\n".join(lines),
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        print("已取消")
+        raise SystemExit(1)
+    selected_index = int(proc.stdout.strip().split(".", 1)[0]) - 1
+else:
+    print(f"策略组: {group}")
+    print(f"当前节点: {current or '-'}")
+    if keyword:
+        print(f"过滤关键词: {keyword}")
+    print("")
+    for line in lines:
+        print(line)
+    if not sys.stdin.isatty():
+        if len(rows) == 1:
+            selected_index = 0
+        else:
+            print("非交互式终端下需要过滤到唯一节点", file=sys.stderr)
+            raise SystemExit(1)
+    else:
+        choice = input("\n选择节点编号 (空回车取消): ").strip()
+        if not choice:
+            print("已取消")
+            raise SystemExit(1)
+        if not choice.isdigit() or not (1 <= int(choice) <= len(rows)):
+            print("节点编号无效", file=sys.stderr)
+            raise SystemExit(1)
+        selected_index = int(choice) - 1
+
+selected = rows[selected_index]["name"]
+encoded_group = urllib.parse.quote(group, safe="")
+request("PUT", f"/proxies/{encoded_group}", {"name": selected})
+print(f"已切换策略组 [{group}] -> {selected}")
+PY
+}
+
 function clashui() {
     _get_ui_port
     # 公网ip
@@ -771,6 +999,10 @@ function clashctl() {
         shift
         clashupdate "$@"
         ;;
+    pick)
+        shift
+        clashpick "$@"
+        ;;
     tui)
         clashtui
         ;;
@@ -788,6 +1020,7 @@ Commands:
     restart                 重启代理服务
     status                  进程运行状态
     tui                     交互式终端界面（TUI）
+    pick     [关键词] [-g 策略组] 快速选择代理节点
     ui                      Web 控制台地址
     proxy    [on|off|status]       系统代理环境变量
     port     [status|auto|set]     代理端口模式设置
