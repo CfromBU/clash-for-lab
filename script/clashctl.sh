@@ -1,6 +1,12 @@
 # shellcheck disable=SC2148
 # shellcheck disable=SC2155
 
+_is_tcp_port_listening() {
+    local port=$1
+    [ -n "$port" ] || return 1
+    ss -ltnH 2>/dev/null | awk '{print $4}' | grep -Eq "(^|.*[:.])${port}$"
+}
+
 _set_system_proxy() {
     # Ensure config files exist before reading
     [ ! -f "$MIHOMO_CONFIG_RUNTIME" ] && {
@@ -451,7 +457,7 @@ plain = os.environ.get("CLASH_PICK_PLAIN") == "1"
 test_delay = os.environ.get("CLASH_PICK_TEST_DELAY") == "1"
 
 
-def request(method, path, payload=None):
+def request(method, path, payload=None, quiet=False):
     data = None
     headers = {"Content-Type": "application/json"}
     if secret:
@@ -463,10 +469,14 @@ def request(method, path, payload=None):
         with urllib.request.urlopen(req, timeout=10) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as exc:
+        if quiet:
+            return None
         body = exc.read().decode("utf-8", "replace")[:300]
         print(f"mihomo API 请求失败: HTTP {exc.code} {body}", file=sys.stderr)
         raise SystemExit(1)
     except Exception as exc:
+        if quiet:
+            return None
         print(f"mihomo API 不可用: {exc}", file=sys.stderr)
         raise SystemExit(1)
     if not raw:
@@ -486,11 +496,8 @@ def is_switch_group(item):
 def fetch_delay(name):
     encoded = urllib.parse.quote(name, safe="")
     path = f"/proxies/{encoded}/delay?timeout=3000&url=https%3A%2F%2Fwww.google.com%2Fgenerate_204"
-    try:
-        data = request("GET", path)
-    except SystemExit:
-        return "timeout"
-    except Exception:
+    data = request("GET", path, quiet=True)
+    if not isinstance(data, dict):
         return "timeout"
     delay = data.get("delay") if isinstance(data, dict) else None
     if delay is None or delay < 0:
