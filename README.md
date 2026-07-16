@@ -118,6 +118,10 @@ Commands:
     on                      开启代理
     off                     关闭代理
     restart                 重启代理服务
+    menu                    一键交互菜单
+    check                   测试 Google/OpenAI/国内网络
+    profile  [list|add|use|pick|rm]  多订阅/直连切换
+    hostproxy [on|off|status] [端口] 本机 SSH 代理兜底
     proxy    [on|off|status]       系统代理环境变量
     port     [status|auto|set]     代理端口模式设置
     ui                      Web 控制台地址
@@ -172,6 +176,60 @@ clash off
 
 ### 3. 高级功能
 
+#### 3.0 一键交互菜单和网络自检
+
+```bash
+# 打开数字菜单：查网络、切订阅、切节点、启用本机代理兜底、改端口
+clash menu
+
+# 一键检查当前外网/国内网络
+clash check
+```
+
+`clash check` 会测试：
+
+- `Google via proxy`：通过当前 mihomo 代理访问 Google。
+- `OpenAI via proxy`：通过当前 mihomo 代理访问 OpenAI API。
+- `Baidu direct` / `Tencent direct`：不走代理，测试国内直连网络。
+
+#### 3.0.1 多订阅和直连模式
+
+```bash
+# 保存多个订阅
+clash profile add boost https://your-subscription-url
+clash profile add backup https://another-subscription-url
+
+# 编号交互式切换订阅；0 表示 direct，不使用代理
+clash profile pick
+
+# 直接切换
+clash profile use boost
+clash profile use direct
+
+# 查看当前订阅列表
+clash profile list
+```
+
+`direct` 会关闭 mihomo 并清理代理环境变量，适合实验室网络本身可直连或者临时不想走梯子的时候。
+
+#### 3.0.2 本机代理兜底
+
+如果订阅节点都不可用，可以让 A800 通过 SSH 远程转发使用本机代理。例如本机代理端口是 `7890`，SSH 配置里使用：
+
+```sshconfig
+Host A800
+    RemoteForward 18888 127.0.0.1:7890
+```
+
+A800 上启用兜底节点：
+
+```bash
+clash hostproxy on 18888
+clash hostproxy status 18888
+```
+
+这会在 mihomo 里加入 `LOCAL-SSH-18888` 节点，并优先放到常见策略组里。端口不是 `18888` 时，把命令里的端口换成自己的即可。
+
 #### 3.1 固定代理端口
 
 ```bash
@@ -220,12 +278,13 @@ clash pick groups
 clash pick -g Proxy 新加坡
 ```
 
-`clash pick` 会连接本机 mihomo API 读取当前策略组和节点列表。有 `fzf` 且处于交互式终端时，会自动打开可搜索列表；没有 `fzf` 时会退回编号菜单。
+`clash pick` 会连接本机 mihomo API 读取当前策略组和节点列表，默认刷新延迟后展示。有 `fzf` 且处于交互式终端时，会自动打开可搜索列表；没有 `fzf` 时会退回编号菜单。
 
 常见用法：
 
 - `clash pick 美国`：快速过滤并选择美国节点，避免自动选择到被目标网站拦截的出口。
 - `clash pick --plain`：强制使用编号菜单，适合不想进入 `fzf` 的终端。
+- `clash pick --no-test`：不刷新延迟，直接用已有缓存，适合节点很多时快速切换。
 - `clash pick -g 自动选择`：在非默认策略组中手动指定当前节点。
 
 #### 3.4 TUI 交互式界面

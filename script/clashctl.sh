@@ -360,6 +360,7 @@ function clashpick() {
     local keyword=""
     local list_groups=false
     local plain=false
+    local test_delay=true
 
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -379,9 +380,17 @@ function clashpick() {
             plain=true
             shift
             ;;
+        --test)
+            test_delay=true
+            shift
+            ;;
+        --no-test|--cached)
+            test_delay=false
+            shift
+            ;;
         -h|--help)
             cat <<EOF
-用法: clash pick [关键词] [-g 策略组] [--plain]
+用法: clash pick [关键词] [-g 策略组] [--plain] [--no-test]
 
 示例:
     clash pick              选择 Proxy 策略组中的节点
@@ -390,7 +399,7 @@ function clashpick() {
     clash pick groups       列出可切换的策略组
 
 说明:
-    有 fzf 且处于交互式终端时会打开可搜索列表；否则使用编号菜单。
+    默认会刷新并显示节点延迟。有 fzf 且处于交互式终端时会打开可搜索列表；否则使用编号菜单。
 EOF
             return 0
             ;;
@@ -421,7 +430,9 @@ EOF
     CLASH_PICK_FILTER="$keyword" \
     CLASH_PICK_LIST_GROUPS="$([ "$list_groups" = true ] && printf 1 || printf 0)" \
     CLASH_PICK_PLAIN="$([ "$plain" = true ] && printf 1 || printf 0)" \
+    CLASH_PICK_TEST_DELAY="$([ "$test_delay" = true ] && printf 1 || printf 0)" \
     python3 <<'PY'
+import concurrent.futures
 import json
 import os
 import shutil
@@ -437,6 +448,7 @@ requested_group = os.environ.get("CLASH_PICK_GROUP", "").strip()
 keyword = os.environ.get("CLASH_PICK_FILTER", "").strip()
 list_groups = os.environ.get("CLASH_PICK_LIST_GROUPS") == "1"
 plain = os.environ.get("CLASH_PICK_PLAIN") == "1"
+test_delay = os.environ.get("CLASH_PICK_TEST_DELAY") == "1"
 
 
 def request(method, path, payload=None):
@@ -469,6 +481,21 @@ def is_switch_group(item):
         "Fallback",
         "LoadBalance",
     }
+
+
+def fetch_delay(name):
+    encoded = urllib.parse.quote(name, safe="")
+    path = f"/proxies/{encoded}/delay?timeout=3000&url=https%3A%2F%2Fwww.google.com%2Fgenerate_204"
+    try:
+        data = request("GET", path)
+    except SystemExit:
+        return "timeout"
+    except Exception:
+        return "timeout"
+    delay = data.get("delay") if isinstance(data, dict) else None
+    if delay is None or delay < 0:
+        return "timeout"
+    return f"{delay}ms"
 
 
 data = request("GET", "/proxies")
@@ -526,6 +553,17 @@ if not rows:
     print(f"策略组 [{group}] 下没有匹配节点: {keyword}", file=sys.stderr)
     raise SystemExit(1)
 
+if test_delay:
+    limit = min(len(rows), 80)
+    print(f"正在测试延迟: {limit}/{len(rows)} 个节点 ...", file=sys.stderr)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+        futures = {
+            executor.submit(fetch_delay, row["name"]): idx
+            for idx, row in enumerate(rows[:limit])
+        }
+        for future in concurrent.futures.as_completed(futures):
+            rows[futures[future]]["delay"] = future.result()
+
 
 def render_line(index, row):
     mark = "*" if row["current"] else " "
@@ -538,8 +576,11 @@ def render_line(index, row):
 selected_index = None
 lines = [render_line(i, row) for i, row in enumerate(rows, 1)]
 use_fzf = (not plain and shutil.which("fzf") and sys.stdin.isatty() and sys.stdout.isatty())
+exact_matches = [idx for idx, row in enumerate(rows) if keyword and row["name"] == keyword]
 
-if use_fzf:
+if len(exact_matches) == 1:
+    selected_index = exact_matches[0]
+elif use_fzf:
     prompt = f"{group}> "
     proc = subprocess.run(
         ["fzf", "--height=80%", "--reverse", "--prompt", prompt, "--query", keyword],
@@ -820,6 +861,364 @@ function clashlan() {
     esac
 }
 
+_profile_store() {
+    printf "%s\n" "${MIHOMO_BASE_DIR}/config/profiles.tsv"
+}
+
+_profile_active_file() {
+    printf "%s\n" "${MIHOMO_BASE_DIR}/config/profile.active"
+}
+
+_profile_init() {
+    local store=$(_profile_store)
+    mkdir -p "$(dirname "$store")"
+    [ -f "$store" ] && return 0
+
+    local url=$(cat "$MIHOMO_CONFIG_URL" 2>/dev/null)
+    : > "$store"
+    [ "${url:0:4}" = "http" ] && printf "default\t%s\n" "$url" >> "$store"
+}
+
+_profile_url_by_name() {
+    local name=$1
+    local store=$(_profile_store)
+    awk -F '\t' -v n="$name" '$1 == n {print $2; found=1; exit} END {exit found ? 0 : 1}' "$store"
+}
+
+_profile_write_active() {
+    local active=$1
+    local active_file=$(_profile_active_file)
+    mkdir -p "$(dirname "$active_file")"
+    printf "%s\n" "$active" > "$active_file"
+}
+
+_profile_current_name() {
+    local active_file=$(_profile_active_file)
+    [ -f "$active_file" ] && {
+        cat "$active_file" 2>/dev/null
+        return 0
+    }
+
+    local current_url=$(cat "$MIHOMO_CONFIG_URL" 2>/dev/null)
+    local store=$(_profile_store)
+    [ -f "$store" ] && awk -F '\t' -v u="$current_url" '$2 == u {print $1; found=1; exit} END {exit found ? 0 : 1}' "$store"
+}
+
+function clashprofile() {
+    local action=${1:-list}
+    shift || true
+    _profile_init
+
+    local store=$(_profile_store)
+    case "$action" in
+    list|ls)
+        local active=$(_profile_current_name)
+        _okcat "订阅配置:"
+        if [ "$active" = "direct" ]; then
+            printf "  * 0. direct  不使用代理\n"
+        else
+            printf "    0. direct  不使用代理\n"
+        fi
+        awk -F '\t' -v active="$active" 'NF >= 2 {
+            mark = ($1 == active) ? "*" : " "
+            printf("  %s %d. %s  %s\n", mark, NR, $1, $2)
+        }' "$store"
+        ;;
+    add)
+        local name=$1
+        local url=$2
+        if [ -z "$name" ] || [ -z "$url" ]; then
+            _failcat "用法: clash profile add <名称> <订阅URL>"
+            return 1
+        fi
+        if printf "%s" "$name" | grep -q '[[:space:]]'; then
+            _failcat "订阅名称不要包含空格"
+            return 1
+        fi
+        if [ "${url:0:4}" != "http" ]; then
+            _failcat "订阅 URL 必须以 http 或 https 开头"
+            return 1
+        fi
+        local tmp="${store}.tmp.$$"
+        awk -F '\t' -v n="$name" '$1 != n' "$store" > "$tmp" 2>/dev/null || true
+        printf "%s\t%s\n" "$name" "$url" >> "$tmp"
+        mv -f "$tmp" "$store"
+        _okcat "已保存订阅: $name"
+        ;;
+    rm|remove|delete)
+        local name=$1
+        [ -n "$name" ] || {
+            _failcat "用法: clash profile rm <名称>"
+            return 1
+        }
+        local tmp="${store}.tmp.$$"
+        awk -F '\t' -v n="$name" '$1 != n' "$store" > "$tmp"
+        mv -f "$tmp" "$store"
+        _okcat "已删除订阅: $name"
+        ;;
+    use|switch)
+        local name=$1
+        [ -n "$name" ] || {
+            _failcat "用法: clash profile use <名称|direct>"
+            return 1
+        }
+        if [ "$name" = "direct" ] || [ "$name" = "off" ] || [ "$name" = "none" ]; then
+            _profile_write_active direct
+            clashoff
+            _okcat "已切换到直连模式"
+            return 0
+        fi
+
+        local url
+        if [ "${name:0:4}" = "http" ]; then
+            url=$name
+            name=temporary
+        else
+            url=$(_profile_url_by_name "$name") || {
+                _failcat "未找到订阅: $name"
+                return 1
+            }
+        fi
+        _profile_write_active "$name"
+        mkdir -p "$(dirname "$MIHOMO_CONFIG_URL")"
+        printf "%s\n" "$url" > "$MIHOMO_CONFIG_URL"
+        clashupdate "$url"
+        ;;
+    pick|menu)
+        local active=$(_profile_current_name)
+        clashprofile list
+        printf "\n选择订阅编号 (0 为直连，空回车取消): "
+        read -r choice
+        [ -n "$choice" ] || {
+            _okcat "已取消"
+            return 0
+        }
+        if ! [[ $choice =~ ^[0-9]+$ ]]; then
+            _failcat "请输入数字编号"
+            return 1
+        fi
+        if [ "$choice" = "0" ]; then
+            clashprofile use direct
+            return $?
+        fi
+        local name
+        name=$(awk -F '\t' -v n="$choice" 'NR == n {print $1; found=1; exit} END {exit found ? 0 : 1}' "$store") || {
+            _failcat "订阅编号无效"
+            return 1
+        }
+        clashprofile use "$name"
+        ;;
+    current)
+        local active=$(_profile_current_name)
+        [ -n "$active" ] || active="unknown"
+        _okcat "当前订阅: $active"
+        ;;
+    *)
+        cat <<EOF
+用法: clash profile <命令>
+    list                 列出订阅和直连模式
+    add <名称> <URL>      保存一个订阅
+    use <名称|direct>     切换订阅；direct 表示不使用代理
+    pick                 编号交互式切换订阅
+    rm <名称>             删除订阅
+    current              查看当前订阅
+EOF
+        ;;
+    esac
+}
+
+_check_url() {
+    local label=$1
+    local url=$2
+    local proxy_url=$3
+    local direct_mode=$4
+
+    set --
+    [ -n "$proxy_url" ] && set -- "$@" --proxy "$proxy_url"
+    [ "$direct_mode" = "direct" ] && set -- "$@" --noproxy "*"
+
+    local result
+    result=$(curl -sS -o /dev/null \
+        --connect-timeout 5 \
+        --max-time 12 \
+        -w "%{http_code} connect=%{time_connect} total=%{time_total}" \
+        "$@" \
+        "$url" 2>&1)
+    local code=$?
+    if [ "$code" -eq 0 ]; then
+        _okcat "$label: $result"
+    else
+        _failcat "$label: failed ($result)"
+    fi
+}
+
+function clashcheck() {
+    _verify_actual_ports 2>/dev/null || true
+    _get_proxy_port
+
+    local proxy="http://127.0.0.1:${MIXED_PORT}"
+    _okcat "代理端口: ${MIXED_PORT}"
+    if is_mihomo_running; then
+        _okcat "mihomo: running"
+    else
+        _failcat "mihomo: not running"
+    fi
+
+    _check_url "Google via proxy" "https://www.google.com/generate_204" "$proxy" ""
+    _check_url "OpenAI via proxy" "https://api.openai.com/v1/models" "$proxy" ""
+    _check_url "Baidu direct" "https://www.baidu.com" "" direct
+    _check_url "Tencent direct" "https://www.qq.com" "" direct
+}
+
+_hostproxy_name() {
+    local port=${1:-18888}
+    printf "LOCAL-SSH-%s\n" "$port"
+}
+
+_hostproxy_apply() {
+    local name=$1
+    local port=$2
+    local mode=$3
+
+    HOST_PROXY_FILE="$MIHOMO_CONFIG_MIXIN" \
+    HOST_PROXY_NAME="$name" \
+    HOST_PROXY_PORT="$port" \
+    HOST_PROXY_MODE="$mode" \
+    python3 <<'PY'
+import os
+from pathlib import Path
+
+import yaml
+
+path = Path(os.environ["HOST_PROXY_FILE"])
+name = os.environ["HOST_PROXY_NAME"]
+port = int(os.environ["HOST_PROXY_PORT"])
+mode = os.environ["HOST_PROXY_MODE"]
+
+if path.exists():
+    with path.open("r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+else:
+    data = {}
+
+proxies = [item for item in data.get("proxies", []) or [] if item.get("name") != name]
+groups = data.get("proxy-groups", []) or []
+
+if mode == "on":
+    proxies.insert(0, {
+        "name": name,
+        "type": "socks5",
+        "server": "127.0.0.1",
+        "port": port,
+    })
+
+for group in groups:
+    group_proxies = [item for item in group.get("proxies", []) or [] if item != name]
+    group_type = str(group.get("type", "")).lower()
+    if mode == "on" and (
+        group.get("name") in {"Proxy", "GLOBAL", "BoostNet"} or group_type == "select"
+    ):
+        group["proxies"] = [name] + group_proxies
+    else:
+        group["proxies"] = group_proxies
+
+data["proxies"] = proxies
+data["proxy-groups"] = groups
+path.parent.mkdir(parents=True, exist_ok=True)
+with path.open("w", encoding="utf-8") as fh:
+    yaml.safe_dump(data, fh, allow_unicode=True, sort_keys=False)
+PY
+}
+
+function clashhostproxy() {
+    local action=${1:-status}
+    local port=${2:-18888}
+    local name=$(_hostproxy_name "$port")
+
+    case "$action" in
+    on|enable)
+        if ! [[ $port =~ ^[0-9]+$ ]]; then
+            _failcat "端口必须是数字"
+            return 1
+        fi
+        mkdir -p "$(dirname "$MIHOMO_CONFIG_MIXIN")"
+        _hostproxy_apply "$name" "$port" on || {
+            _failcat "写入本机代理节点失败"
+            return 1
+        }
+        _merge_config_restart || return 1
+        _okcat "已加入本机代理节点: $name"
+        _okcat "请确保 SSH 已建立 RemoteForward: A800:${port} -> 本机代理端口"
+        clashpick --plain --no-test -g BoostNet "$name" 2>/dev/null || true
+        clashpick --plain --no-test -g GLOBAL "$name" 2>/dev/null || true
+        ;;
+    off|disable)
+        _hostproxy_apply "$name" "$port" off || {
+            _failcat "移除本机代理节点失败"
+            return 1
+        }
+        _merge_config_restart || return 1
+        _okcat "已移除本机代理节点: $name"
+        ;;
+    status)
+        if _is_bind "$port" >/dev/null 2>&1; then
+            _okcat "A800 本地端口 ${port}: listening"
+        else
+            _failcat "A800 本地端口 ${port}: not listening"
+        fi
+        _check_url "Host proxy Google" "https://www.google.com/generate_204" "socks5h://127.0.0.1:${port}" ""
+        ;;
+    *)
+        cat <<EOF
+用法: clash hostproxy [on|off|status] [端口]
+    on 18888      加入并优先使用本机 SSH 转发代理节点
+    off 18888     移除这个本机代理节点
+    status 18888  测试 A800 上的本机代理转发口
+EOF
+        ;;
+    esac
+}
+
+function clashmenu() {
+    while true; do
+        cat <<EOF
+
+Clash for Lab 快捷菜单
+  1. 查看网络情况
+  2. 切换订阅/直连
+  3. 切换节点
+  4. 启用本机代理兜底
+  5. 设置代理端口
+  6. 查看状态
+  0. 退出
+EOF
+        printf "请选择: "
+        read -r choice
+        case "$choice" in
+        1) clashcheck ;;
+        2) clashprofile pick ;;
+        3) clashpick ;;
+        4)
+            printf "本机代理转发端口 [18888]: "
+            read -r port
+            clashhostproxy on "${port:-18888}"
+            ;;
+        5)
+            printf "固定代理端口 [7890，留空为自动]: "
+            read -r port
+            if [ -n "$port" ]; then
+                clashport set "$port"
+            else
+                clashport auto
+            fi
+            ;;
+        6) clashstatus ;;
+        0|"") return 0 ;;
+        *) _failcat "未知选项: $choice" ;;
+        esac
+    done
+}
+
 function clashsubscribe() {
     case "$#" in
     0)
@@ -971,6 +1370,22 @@ function clashctl() {
         shift
         clashproxy "$@"
         ;;
+    check|test|doctor)
+        shift
+        clashcheck "$@"
+        ;;
+    menu)
+        shift
+        clashmenu "$@"
+        ;;
+    profile|profiles)
+        shift
+        clashprofile "$@"
+        ;;
+    hostproxy|host)
+        shift
+        clashhostproxy "$@"
+        ;;
     port)
         shift
         clashport "$@"
@@ -1020,6 +1435,10 @@ Commands:
     restart                 重启代理服务
     status                  进程运行状态
     tui                     交互式终端界面（TUI）
+    menu                    一键交互菜单
+    check                   测试 Google/OpenAI/国内网络
+    profile  [list|add|use|pick|rm]  多订阅/直连切换
+    hostproxy [on|off|status] [端口] 本机 SSH 代理兜底
     pick     [关键词] [-g 策略组] 快速选择代理节点
     ui                      Web 控制台地址
     proxy    [on|off|status]       系统代理环境变量
